@@ -17,8 +17,6 @@
  */
 package oshi.util.platform.windows;
 
-import java.text.ParsePosition;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
@@ -43,6 +41,7 @@ import oshi.jna.platform.windows.COM.EnumWbemClassObject;
 import oshi.jna.platform.windows.COM.WbemClassObject;
 import oshi.jna.platform.windows.COM.WbemLocator;
 import oshi.jna.platform.windows.COM.WbemServices;
+import oshi.util.ParseUtil;
 
 /**
  * Provides access to WMI queries
@@ -54,18 +53,7 @@ public class WmiUtil {
 
     public static final String DEFAULT_NAMESPACE = "ROOT\\CIMV2";
 
-    static {
-        // Initialize COM
-        initCOM();
-
-        // Set up hook to un-initialize COM on shutdown
-        Runtime.getRuntime().addShutdownHook(new Thread() {
-            @Override
-            public void run() {
-                Ole32.INSTANCE.CoUninitialize();
-            }
-        });
-    }
+    private static boolean securityInitialized = false;
 
     /**
      * Enum for WMI queries for proper parsing from the returned VARIANT
@@ -73,11 +61,6 @@ public class WmiUtil {
     public enum ValueType {
         STRING, LONG, FLOAT, DATETIME
     }
-
-    /*
-     * Format for parsing DATETIME 20160513072950.782000-420
-     */
-    private static final SimpleDateFormat cimDateFormat = new SimpleDateFormat("yyyyMMddHHmmss.S");
 
     /**
      * Get a single Long value from WMI
@@ -317,22 +300,33 @@ public class WmiUtil {
             values.put(props[i], new ArrayList<Object>());
         }
 
+        // Initialize COM
+        if (!initCOM()) {
+            Ole32.INSTANCE.CoUninitialize();
+            return values;
+        }
+
         PointerByReference pSvc = new PointerByReference();
         if (!connectServer(namespace, pSvc)) {
+            Ole32.INSTANCE.CoUninitialize();
             return values;
         }
         WbemServices svc = new WbemServices(pSvc.getValue());
 
         PointerByReference pEnumerator = new PointerByReference();
         if (!selectProperties(svc, pEnumerator, properties, wmiClass, whereClause)) {
+            svc.Release();
+            Ole32.INSTANCE.CoUninitialize();
             return values;
         }
         EnumWbemClassObject enumerator = new EnumWbemClassObject(pEnumerator.getValue());
 
         enumerateProperties(values, enumerator, props, propertyTypes);
 
+        // Cleanup
         enumerator.Release();
         svc.Release();
+        Ole32.INSTANCE.CoUninitialize();
         return values;
     }
 
@@ -343,7 +337,6 @@ public class WmiUtil {
      * https://msdn.microsoft.com/en-us/library/aa390423(v=VS.85).aspx
      */
 
-    // PERFORM ONLY ONCE PER PROCESS
     private static boolean initCOM() {
         // Step 1: --------------------------------------------------
         // Initialize COM. ------------------------------------------
@@ -352,14 +345,20 @@ public class WmiUtil {
             LOG.error(String.format("Failed to initialize COM library. Error code = 0x%08x", hres.intValue()));
             return false;
         }
+        if (securityInitialized) {
+            // Only run CoInitializeSecuirty once
+            return true;
+        }
         // Step 2: --------------------------------------------------
         // Set general COM security levels --------------------------
         hres = Ole32.INSTANCE.CoInitializeSecurity(null, new NativeLong(-1), null, null,
                 Ole32.RPC_C_AUTHN_LEVEL_DEFAULT, Ole32.RPC_C_IMP_LEVEL_IMPERSONATE, null, Ole32.EOAC_NONE, null);
-        if (COMUtils.FAILED(hres)) {
+        if (COMUtils.FAILED(hres) && hres.intValue() != Ole32.RPC_E_TOO_LATE) {
             LOG.error(String.format("Failed to initialize security. Error code = 0x%08x", hres.intValue()));
+            Ole32.INSTANCE.CoUninitialize();
             return false;
         }
+        securityInitialized = true;
         return true;
     }
 
@@ -379,11 +378,11 @@ public class WmiUtil {
             LOG.error(String.format("Could not connect to namespace %s. Error code = 0x%08x", namespace,
                     hres.intValue()));
             loc.Release();
+            Ole32.INSTANCE.CoUninitialize();
             return false;
         }
-        // Done with locator
-        loc.Release();
         LOG.debug("Connected to {} WMI namespace", namespace);
+        loc.Release();
 
         // Step 5: --------------------------------------------------
         // Set security levels on the proxy -------------------------
@@ -392,6 +391,7 @@ public class WmiUtil {
         if (COMUtils.FAILED(hres)) {
             LOG.error(String.format("Could not set proxy blanket. Error code = 0x%08x", hres.intValue()));
             new WbemServices(pSvc.getValue()).Release();
+            Ole32.INSTANCE.CoUninitialize();
             return false;
         }
         return true;
@@ -411,6 +411,7 @@ public class WmiUtil {
         if (COMUtils.FAILED(hres)) {
             LOG.error(String.format("Query '%s' failed. Error code = 0x%08x", query, hres.intValue()));
             svc.Release();
+            Ole32.INSTANCE.CoUninitialize();
             return false;
         }
         return true;
@@ -457,7 +458,7 @@ public class WmiUtil {
                     // parse to a long representing Date.getTime()
                     if (vtProp.getValue() != null) {
                         // Parse the date including milliseconds
-                        Date date = cimDateFormat.parse(vtProp.stringValue().substring(0, 18), new ParsePosition(0));
+                        Date date = ParseUtil.cimDateTimeToDate(vtProp.stringValue());
                         if (date != null) {
                             values.get(property).add(date);
                             break;
